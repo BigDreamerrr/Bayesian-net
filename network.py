@@ -1,3 +1,4 @@
+import itertools
 import numpy as np
 import pandas as pd
 import math
@@ -110,45 +111,6 @@ class GraphTool:
 
         return max_degree
 
-class Binner:                          
-    def binning(self, X, bin_counts):
-        df = pd.DataFrame(X)
-
-        self.binning_intervals = [None] * len(bin_counts)
-
-        for i in range(X.shape[1]):
-            if bin_counts[i] == -1:
-                continue # ignore this column
-
-            df[i] = pd.qcut(df[i], q=bin_counts[i])
-            intervals = df[i].value_counts()
-
-            for j in range(X.shape[0]):
-                label = 0
-                for interval in intervals.items():
-                    if X[j][i] in interval[0]:
-                        X[j][i] = label
-                        break
-
-                    label += 1
-
-            self.binning_intervals[i] = intervals
-
-    def transform(self, X):
-        for i in range(X.shape[1]):
-            if self.binning_intervals[i] is None:
-                continue # ignore this column
-
-            intervals = self.binning_intervals[i]
-            for j in range(X.shape[0]):
-                label = 0
-                for interval in intervals.items():
-                    if X[j][i] in interval[0]:
-                        X[j][i] = label
-                        break
-
-                    label += 1
-
 class BayesianNetwork:
     def __init__(self, cpt_path=None):
         self.cpt_path = cpt_path
@@ -213,6 +175,48 @@ class BayesianNetwork:
                 break
 
         return independent
+    
+    def A_generator(elem_cnt, size):
+        return list(itertools.permutations(list(range(elem_cnt)), size))
+    
+    def find_colliders(self, X, H, max_column_labels, num_vars, threshold):
+        generator = BayesianNetwork.A_generator(num_vars, 3)
+
+        for i, j, k in generator:
+            if self.no_edge_check(i, j, H) or \
+                (self.no_edge_check(i, k, H)) or \
+                (not self.no_edge_check(j, k, H)):
+                continue
+
+            if not BayesianNetwork.CI_tests(
+                X,
+                j,
+                k,
+                max_column_labels[j],
+                max_column_labels[k],
+                [i,], 
+                threshold): # j -> i, k -> i
+                i_j_directed = self.directed_check(i, j, H)
+                i_k_directed = self.directed_check(i, k, H)
+
+                if (i_j_directed and j in H[i]) or (i_k_directed and k in H[i]):
+                    continue # ignore this CI test
+
+                if not i_j_directed:
+                    H[i].remove(j)
+                
+                if not i_k_directed:
+                    H[i].remove(k)
+
+    def directed_check(self, i, j, H):
+        # i -> j only or j -> i only
+        return (i in H[j] and j not in H[i]) or (j in H[i] and i not in H[j])
+    
+    def undirected_check(self, i, j, H):
+        return (i in H[j] and j in H[i])
+    
+    def no_edge_check(self, i, j, H):
+        return (i not in H[j] and j not in H[i])
 
     def fit(self, X, cpt_path, threshold=1e-2):
         num_vars = X.shape[1]
@@ -221,6 +225,9 @@ class BayesianNetwork:
 
         subsets_generator = BayesianNetwork.generate_subset(num_vars - 2, num_vars)
         max_column_labels = np.max(X, axis=0)
+
+        choose_3 = BayesianNetwork.A_generator(num_vars, 3)
+        choose_4 = BayesianNetwork.A_generator(num_vars, 4)
 
         for subsets in subsets_generator:
             l = len(subsets[0])
@@ -252,44 +259,34 @@ class BayesianNetwork:
                         break # check next pair
 
         # check all triplets
-        for i in range(num_vars):
-            for j in range(num_vars):
-                for k in range(j + 1, num_vars):
-                    if j == i or k == i or (j in H[k]) \
-                        or (i not in H[j]) or (i not in H[k]):
-                        continue 
-                        # ignore this triplet if i, j is not valid or
-                        # k <-> j is feasible, 
-                        # i <-> j not feasible
-                        # i <-> k not feasible
+        self.find_colliders(X, H, max_column_labels, num_vars, threshold)
 
-                    if BayesianNetwork.CI_tests(
-                        X,
-                        j,
-                        k,
-                        max_column_labels[j],
-                        max_column_labels[k],
-                        [i,], 
-                        threshold
-                    ): # i -> j, i -> k
-                        if (i not in H[j] or i not in H[k]):
-                            continue
-                        
-                        H[j].remove(i)
-                        H[k].remove(i)
-                    else: # j -> i, k -> i
-                        if (j not in H[i] or k not in H[i]):
-                            continue
-
-                        H[i].remove(j)
-                        H[i].remove(k)
+        # R1, R2
+        for i, j, k in choose_3:
+            if (j in H[i] and \
+                self.undirected_check(j, k, H) and \
+                self.no_edge_check(i, k, H)):
+                H[k].remove(j) # j -> k only
+            elif (j in H[i] and k in H[j] and self.undirected_check(i, k, H)):
+                H[k].remove(i) # i -> k only
+        
+        # R3
+        for i, j, k, m in choose_4:
+            if self.undirected_check(i, j, H) and self.undirected_check(i, k, H) and\
+                self.undirected_check(i, m, H) and (m in H[j]) and (m in H[k]):
+                H[m].remove(i) # i -> m
 
         # complete the graph
         GraphTool.edges_adder(H)
         BayesianNetwork.save_cpt_to_disk(H, num_vars, X, max_column_labels, cpt_path)
 
+        if GraphTool.isCyclic(H):
+            return False
+
         self.max_column_labels = max_column_labels
         self.cpt_path = cpt_path
+
+        return True
 
     def save_cpt_to_disk(H, num_vars, X, max_column_labels, cpt_path):
         # find parents
@@ -334,7 +331,7 @@ class BayesianNetwork:
             f.close()
             table = tables.get(tup)
 
-            if table is None:
+            if table is None or len(table) <= fet_vec[i]:
                 return 0 # not enough information
 
             prob *= table[fet_vec[i]]
